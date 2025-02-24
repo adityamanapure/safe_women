@@ -69,7 +69,7 @@ def home():
         feed_name = request.form['feed_name']
         feed_url = request.form['feed_url']
         
-        # Add to the camera feeds dictionary
+        
         camera_feeds[feed_name] = feed_url
         detection_status[feed_name] = False
         
@@ -98,7 +98,7 @@ def generate_frames(feed_name):
                 break
             continue
             
-        # Apply YOLO assault detection if model is loaded
+      
         if model is not None:
             results = model(frame)
             assault_detected = False
@@ -117,7 +117,7 @@ def generate_frames(feed_name):
                         cv2.putText(frame, f"{label}: {confidence:.2f}", (x1, y1-10), 
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
             
-            # Update detection status and add alert if assault is detected
+            
             if assault_detected and not detection_status.get(feed_name, False):
                 detection_status[feed_name] = True
                 timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -135,7 +135,7 @@ def generate_frames(feed_name):
                 cv2.putText(frame, "ASSAULT DETECTED", (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
                 
-        # Convert the frame to JPEG format for streaming
+       
         ret, buffer = cv2.imencode('.jpg', frame)
         frame = buffer.tobytes()
         
