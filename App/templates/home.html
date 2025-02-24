@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+
+{% block title %}Home - Safe Women{% endblock %}
+
+{% block content %}
+<div class="form-container">
+    <h2>Add Camera Feed</h2>
+    <form method="post">
+        <div class="form-group">
+            <label for="feed_name">Camera Name:</label>
+            <input type="text" id="feed_name" name="feed_name" required>
+        </div>
+        <div class="form-group">
+            <label for="feed_url">Camera URL/Path:</label>
+            <input type="text" id="feed_url" name="feed_url" required placeholder="Enter RTSP URL, IP camera address, or local video file path">
+        </div>
+        <div class="form-group">
+            <button type="submit">Add Camera</button>
+        </div>
+    </form>
+</div>
+
+<div class="camera-list">
+    <h2>Available Cameras</h2>
+    {% if camera_feeds %}
+        {% for name, url in camera_feeds.items() %}
+        <div class="camera-item">
+            <div>
+                <strong>{{ name }}</strong>
+                <p>{{ url }}</p>
+            </div>
+            <a href="{{ url_for('live_feed') }}#{{ name }}">View Feed</a>
+        </div>
+        {% endfor %}
+    {% else %}
+        <p>No camera feeds available. Add a camera above.</p>
+    {% endif %}
+</div>
+{% endblock %}

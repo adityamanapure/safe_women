@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+
+{% block title %}Live Feed{% endblock %}
+
+{% block content %}
+<div class="alert-banner" id="alertBanner">
+    🚨 ASSAULT DETECTED! Check the alerts below for details.
+</div>
+
+<div class="alert-list">
+    <h2>Recent Alerts</h2>
+    <a href="{{ url_for('clear_alerts') }}"><button class="clear-alerts">Clear Alerts</button></a>
+    <div id="alertsList">
+        <!-- Alerts will be populated here via JavaScript -->
+        <div class="alert-item">No alerts yet.</div>
+    </div>
+</div>
+
+<h2>Live Camera Feeds with Assault Detection</h2>
+
+{% if camera_feeds %}
+    <div class="feed-container">
+        {% for name, url in camera_feeds.items() %}
+        <div class="feed" id="{{ name }}">
+            <h3>{{ name }}</h3>
+            <div class="assault-indicator" id="indicator-{{ name }}">ASSAULT DETECTED</div>
+            <img src="{{ url_for('video_feed', feed_name=name) }}" alt="{{ name }} feed">
+        </div>
+        {% endfor %}
+    </div>
+{% else %}
+    <p>No camera feeds available. Add cameras from the <a href="{{ url_for('home') }}">Home</a> page.</p>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+    // Function to fetch alerts from the server
+    function fetchAlerts() {
+        fetch('/alerts')
+            .then(response => response.json())
+            .then(data => {
+                const alertsList = document.getElementById('alertsList');
+                const alertBanner = document.getElementById('alertBanner');
+                
+                // Clear existing alerts
+                alertsList.innerHTML = '';
+                
+                if (data.alerts.length === 0) {
+                    alertsList.innerHTML = '<div class="alert-item">No alerts yet.</div>';
+                    alertBanner.classList.remove('active');
+                } else {
+                    // Show the alert banner
+                    alertBanner.classList.add('active');
+                    
+                    // Populate alerts
+                    data.alerts.forEach(alert => {
+                        const alertItem = document.createElement('div');
+                        alertItem.className = 'alert-item';
+                        alertItem.innerHTML = `
+                            <strong>${alert.timestamp}</strong><br>
+                            ${alert.message}
+                        `;
+                        alertsList.appendChild(alertItem);
+                        
+                        // Highlight the feed with assault detection
+                        const indicator = document.getElementById(`indicator-${alert.feed_name}`);
+                        if (indicator) {
+                            indicator.classList.add('active');
+                        }
+                    });
+                }
+            })
+            .catch(error => console.error('Error fetching alerts:', error));
+    }
+    
+    // Fetch alerts every 3 seconds
+    fetchAlerts();
+    setInterval(fetchAlerts, 3000);
+</script>
+{% endblock %}
