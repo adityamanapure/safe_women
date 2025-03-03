@@ -1,4 +1,3 @@
-
 {% extends "base.html" %}
 
 {% block title %}Live Feeds - Safe Women{% endblock %}
@@ -19,6 +18,13 @@
                                 <img src="{{ url_for('video_feed', feed_name=name) }}" alt="{{ name }}" class="video-feed">
                                 <div class="feed-title">{{ name }}</div>
                                 <div class="alert-indicator" id="alert-{{ name }}">ASSAULT DETECTED</div>
+                                <div class="feed-controls">
+                                    <form action="{{ url_for('delete_camera', feed_name=name) }}" method="POST" class="d-inline">
+                                        <button type="submit" class="btn btn-sm btn-danger">
+                                            <i class="fas fa-trash"></i> Delete
+                                        </button>
+                                    </form>
+                                </div>
                             </div>
                         </div>
                         {% endfor %}
@@ -141,5 +147,6 @@
     
     // Initial update
     document.addEventListener('DOMContentLoaded', updateAlerts);
+    
 </script>
 {% endblock %}

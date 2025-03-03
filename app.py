@@ -12,7 +12,7 @@ import mysql.connector
 from mysql.connector import pooling
 
 app = Flask(__name__)
-app.secret_key = 'safe_women'  # Change this to a random string in production
+app.secret_key = 'your_secret_key'  # Change this to a random string in production
 
 # MySQL Configuration
 DB_CONFIG = {
@@ -50,6 +50,19 @@ def initialize_db():
         )
         ''')
         
+        # Create camera_feeds table
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS camera_feeds (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            username VARCHAR(50) NOT NULL,
+            feed_name VARCHAR(100) NOT NULL,
+            feed_url TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (username) REFERENCES users(username) ON DELETE CASCADE,
+            UNIQUE (username, feed_name)
+        )
+        ''')
+        
         # Check if admin user exists
         cursor.execute("SELECT COUNT(*) FROM users WHERE username = 'admin'")
         admin_count = cursor.fetchone()[0]
@@ -71,7 +84,6 @@ def initialize_db():
         print(f"❌ Error initializing database: {e}")
         raise
 
-
 # Create MySQL connection pool
 try:
     connection_pool = pooling.MySQLConnectionPool(
@@ -87,38 +99,6 @@ except Exception as e:
     print(f"❌ Error creating MySQL connection pool: {e}")
     connection_pool = None
 
-def initialize_db():
-    """Initialize database tables if they don't exist"""
-    connection = get_connection()
-    cursor = connection.cursor()
-    
-    # Create users table if it doesn't exist
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS users (
-        username VARCHAR(50) PRIMARY KEY,
-        password VARCHAR(256) NOT NULL,
-        role VARCHAR(10) NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-    ''')
-    
-    # Check if admin user exists, create if not
-    cursor.execute("SELECT * FROM users WHERE username = 'admin'")
-    admin_exists = cursor.fetchone()
-    
-    if not admin_exists:
-        # Create a default admin account
-        admin_password = hashlib.sha256('password'.encode()).hexdigest()
-        cursor.execute(
-            "INSERT INTO users (username, password, role) VALUES (%s, %s, %s)",
-            ('admin', admin_password, 'admin')
-        )
-        print("✅ Default admin user created")
-    
-    connection.commit()
-    cursor.close()
-    connection.close()
-
 def get_connection():
     """Get a connection from the pool"""
     if connection_pool:
@@ -132,7 +112,7 @@ alerts = []
 
 # Load YOLO model
 try:
-    model_path = "models\yolo11_assault.pt"
+    model_path = "models/yolo11_assault.pt"
     model = YOLO(model_path)
     print(f"🔍 YOLO model loaded from {model_path}")
 except Exception as e:
@@ -266,13 +246,47 @@ def home():
         feed_name = request.form['feed_name']
         feed_url = request.form['feed_url']
         
-        # Add to the camera feeds dictionary
-        camera_feeds[feed_name] = feed_url
-        detection_status[feed_name] = False
+        try:
+            connection = get_connection()
+            cursor = connection.cursor()
+            
+            # Store the camera feed in the database
+            cursor.execute(
+                "INSERT INTO camera_feeds (username, feed_name, feed_url) VALUES (%s, %s, %s)",
+                (session['username'], feed_name, feed_url)
+            )
+            connection.commit()
+            cursor.close()
+            connection.close()
+            
+            flash(f'Camera feed "{feed_name}" added successfully', 'success')
+        except mysql.connector.Error as err:
+            if err.errno == 1062:  # Duplicate entry error
+                flash(f'A camera with name "{feed_name}" already exists', 'error')
+            else:
+                flash(f'Database error: {str(err)}', 'error')
         
         return redirect(url_for('home'))
     
-    return render_template('home.html', camera_feeds=camera_feeds, role=session.get('role', 'user'))
+    # Get user's camera feeds from database
+    camera_feeds_for_user = {}
+    try:
+        connection = get_connection()
+        cursor = connection.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT feed_name, feed_url FROM camera_feeds WHERE username = %s",
+            (session['username'],)
+        )
+        results = cursor.fetchall()
+        cursor.close()
+        connection.close()
+        
+        for row in results:
+            camera_feeds_for_user[row['feed_name']] = row['feed_url']
+    except Exception as e:
+        flash(f'Error loading camera feeds: {str(e)}', 'error')
+    
+    return render_template('home.html', camera_feeds=camera_feeds_for_user, role=session.get('role', 'user'))
 
 @app.route('/users')
 @admin_required
@@ -339,6 +353,34 @@ def change_role(username):
         flash(f'Database error: {str(e)}', 'error')
     
     return redirect(url_for('manage_users'))
+
+@app.route('/delete_camera/<feed_name>', methods=['POST'])
+@login_required
+def delete_camera(feed_name):
+    try:
+        connection = get_connection()
+        cursor = connection.cursor()
+        
+        # Delete the camera feed from the database
+        cursor.execute(
+            "DELETE FROM camera_feeds WHERE username = %s AND feed_name = %s",
+            (session['username'], feed_name)
+        )
+        connection.commit()
+        cursor.close()
+        connection.close()
+        
+        # Also remove from in-memory cache if present
+        if feed_name in camera_feeds:
+            del camera_feeds[feed_name]
+        if feed_name in detection_status:
+            del detection_status[feed_name]
+        
+        flash(f'Camera feed "{feed_name}" deleted successfully', 'success')
+    except Exception as e:
+        flash(f'Error deleting camera feed: {str(e)}', 'error')
+    
+    return redirect(url_for('live_feed'))
 
 def generate_frames(feed_name):
     feed_url = camera_feeds[feed_name]
@@ -411,9 +453,27 @@ def generate_frames(feed_name):
 @app.route('/video_feed/<feed_name>')
 @login_required
 def video_feed(feed_name):
-    if feed_name in camera_feeds:
-        return Response(generate_frames(feed_name),
-                       mimetype='multipart/x-mixed-replace; boundary=frame')
+    # Check if feed exists and belongs to user
+    try:
+        connection = get_connection()
+        cursor = connection.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT feed_url FROM camera_feeds WHERE username = %s AND feed_name = %s",
+            (session['username'], feed_name)
+        )
+        feed = cursor.fetchone()
+        cursor.close()
+        connection.close()
+        
+        if feed:
+            # Get feed URL from database and store in memory cache for the detection process
+            camera_feeds[feed_name] = feed['feed_url']
+            
+            return Response(generate_frames(feed_name),
+                          mimetype='multipart/x-mixed-replace; boundary=frame')
+    except Exception as e:
+        print(f"Error in video_feed: {str(e)}")
+    
     return "Feed not found", 404
 
 @app.route('/alerts')
@@ -424,7 +484,27 @@ def get_alerts():
 @app.route('/live_feed')
 @login_required
 def live_feed():
-    return render_template('live_feed.html', camera_feeds=camera_feeds, role=session.get('role', 'user'))
+    # Get user's camera feeds from database
+    camera_feeds_for_user = {}
+    try:
+        connection = get_connection()
+        cursor = connection.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT feed_name, feed_url FROM camera_feeds WHERE username = %s",
+            (session['username'],)
+        )
+        results = cursor.fetchall()
+        cursor.close()
+        connection.close()
+        
+        for row in results:
+            camera_feeds_for_user[row['feed_name']] = row['feed_url']
+            # Also cache in memory for the detection process
+            camera_feeds[row['feed_name']] = row['feed_url']
+    except Exception as e:
+        flash(f'Error loading camera feeds: {str(e)}', 'error')
+    
+    return render_template('live_feed.html', camera_feeds=camera_feeds_for_user, role=session.get('role', 'user'))
 
 @app.route('/clear_alerts')
 @login_required
