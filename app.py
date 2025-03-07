@@ -8,6 +8,9 @@ import threading
 import time
 import hashlib
 import re
+import requests
+from flask_mail import Mail, Message
+import logging
 import mysql.connector
 from mysql.connector import pooling
 
@@ -46,9 +49,12 @@ def initialize_db():
             username VARCHAR(50) PRIMARY KEY,
             password VARCHAR(256) NOT NULL,
             role VARCHAR(10) NOT NULL,
+            emergency_contact VARCHAR(20),
+            emergency_contact_verified BOOLEAN DEFAULT FALSE,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         ''')
+        
         
         # Create camera_feeds table
         cursor.execute('''
@@ -154,7 +160,7 @@ def admin_required(f):
 
 @app.route('/')
 def index():
-    return redirect(url_for('login'))
+    return render_template('index.html')
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
@@ -237,7 +243,7 @@ def signup():
 def logout():
     session.pop('username', None)
     session.pop('role', None)
-    return redirect(url_for('login'))
+    return redirect(url_for('index'))
 
 @app.route('/home', methods=['GET', 'POST'])
 @login_required
@@ -382,7 +388,187 @@ def delete_camera(feed_name):
     
     return redirect(url_for('live_feed'))
 
-def generate_frames(feed_name):
+@app.route('/emergency_contact', methods=['GET', 'POST'])
+@login_required
+def manage_emergency_contact():
+    error = None
+    success = None
+    current_contact = None
+
+    try:
+        connection = get_connection()
+        cursor = connection.cursor(dictionary=True)
+
+        if request.method == 'POST':
+            phone_number = request.form['phone_number']
+            
+            # Validate phone number
+            if not re.match(r'^\+?1?\d{10,14}$', phone_number):
+                error = 'Invalid phone number format. Please include country code.'
+            else:
+                # Update emergency contact in database
+                cursor.execute(
+                    """UPDATE users 
+                    SET emergency_contact = %s, 
+                        emergency_contact_verified = FALSE 
+                    WHERE username = %s""", 
+                    (phone_number, session['username'])
+                )
+                connection.commit()
+                
+                # Send verification code (simulated here, you'd implement actual verification)
+                verification_code = generate_verification_code()
+                send_verification_sms(phone_number, verification_code)
+                
+                success = 'Emergency contact updated. Please verify your number.'
+        
+        # Retrieve current emergency contact
+        cursor.execute(
+            """SELECT emergency_contact, emergency_contact_verified 
+            FROM users WHERE username = %s""", 
+            (session['username'],)
+        )
+        user_info = cursor.fetchone()
+        
+        current_contact = {
+            'number': user_info['emergency_contact'] if user_info else None,
+            'verified': user_info['emergency_contact_verified'] if user_info else False
+        }
+        
+        cursor.close()
+        connection.close()
+    
+    except Exception as e:
+        error = f'Database error: {str(e)}'
+    
+    return render_template('emergency_contact.html', 
+                           error=error, 
+                           success=success, 
+                           current_contact=current_contact)
+
+@app.route('/verify_emergency_contact', methods=['GET', 'POST'])
+@login_required
+def verify_emergency_contact():
+    error = None
+    success = None
+
+    try:
+        connection = get_connection()
+        cursor = connection.cursor(dictionary=True)
+
+        # Retrieve current user's emergency contact
+        cursor.execute(
+            """SELECT emergency_contact 
+            FROM users WHERE username = %s""", 
+            (session['username'],)
+        )
+        user_info = cursor.fetchone()
+
+        if request.method == 'POST':
+            verification_code = request.form['verification_code']
+            
+            # Verify the code (in a real implementation, you'd check against a stored/sent code)
+            if verify_sms_code(verification_code):
+                # Mark contact as verified
+                cursor.execute(
+                    """UPDATE users 
+                    SET emergency_contact_verified = TRUE 
+                    WHERE username = %s""", 
+                    (session['username'],)
+                )
+                connection.commit()
+                
+                success = 'Emergency contact number verified successfully!'
+            else:
+                error = 'Invalid verification code. Please try again.'
+        
+        cursor.close()
+        connection.close()
+    
+    except Exception as e:
+        error = f'Database error: {str(e)}'
+    
+    return render_template('verify_emergency_contact.html', 
+                           error=error, 
+                           success=success, 
+                           contact_number=user_info['emergency_contact'] if user_info else None)
+
+def generate_verification_code():
+    """Generate a 6-digit verification code"""
+    import random
+    return str(random.randint(100000, 999999))
+
+def send_verification_sms(phone_number, verification_code):
+    """Send SMS with verification code"""
+    message = f"Your verification code is: {verification_code}"
+    return send_sms_alert(phone_number, message)
+
+def verify_sms_code(code):
+    """
+    Verify SMS code 
+    Note: In a real implementation, you'd store and check against the actual sent code
+    """
+    # Simulated verification - replace with actual verification logic
+    return len(code) == 6 and code.isdigit()
+
+
+
+# Modify send_sms_alert function to handle verification
+def send_sms_alert(phone_number, message, server_url="https://textbelt.com/text"):
+    """
+    Send SMS alert using Textbelt API with improved error handling
+    
+    Args:
+        phone_number (str): Phone number to send SMS to
+        message (str): Message content
+        server_url (str, optional): Textbelt server URL
+    
+    Returns:
+        bool: True if SMS sent successfully, False otherwise
+    """
+    try:
+        # Prepare payload for smschef API
+        payload = {
+            'key':'textbelt',
+            'phone': phone_number,
+            'message': message,
+            # Optional parameters can be added here
+        }
+        
+        # Send SMS via smschef API
+        response = requests.post(url=server_url, data=payload, timeout=10)
+        
+        # Check response from smschef API
+        response_data = response.json()
+        
+        if response.status_code == 200 and response_data.get('success', False):
+            # Log successful SMS
+            flash(f"SMS sent to {phone_number}")
+            logging.info(f"SMS sent to {phone_number}")
+            return True
+        else:
+            # Log failed SMS attempt
+            flash(f"Failed to send SMS to {phone_number}")
+            logging.warning(f"Failed to send SMS to {phone_number}. Response: {response_data}")
+            return False
+    
+    except Exception as e:
+        # Log any errors
+        logging.error(f"Error sending SMS: {e}")
+        return False
+
+
+def get_location():
+    try:
+        response = requests.get('https://ipinfo.io')
+        data = response.json()
+        location = data.get('loc', 'Unknown location')
+        return location
+    except Exception as e:
+        print(f"Error getting location: {e}")
+        return 'Unknown location'
+    
+def generate_frames(feed_name, emergency_contact):
     feed_url = camera_feeds[feed_name]
     cap = cv2.VideoCapture(feed_url)
     
@@ -393,6 +579,8 @@ def generate_frames(feed_name):
         return
     
     print(f"🔍 Starting detection for feed: {feed_name}")
+    
+    message_sent = False  # Move the flag outside the loop
     
     while True:
         success, frame = cap.read()
@@ -426,14 +614,24 @@ def generate_frames(feed_name):
             if assault_detected and not detection_status.get(feed_name, False):
                 detection_status[feed_name] = True
                 timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+                location = get_location()
                 alerts.append({
                     "feed_name": feed_name,
                     "timestamp": timestamp,
-                    "message": f"🚨 ALERT! Assault detected in {feed_name}!"
+                    "location": location,
+                    "message": f"🚨 ALERT! Assault detected in {feed_name}! Alert Sent to Emergency Contact"
                 })
-                print(f"🚨 ALERT! Assault detected in {feed_name}!")
+                
+                if not message_sent:
+                    send_sms_alert(emergency_contact, 
+                         f"🚨 ALERT! Assault detected in {feed_name} at {timestamp} on location {location}")
+                    message_sent = True
+
+                
             elif not assault_detected:
                 detection_status[feed_name] = False
+                message_sent = False # Reset the flag if no assault is detected
+                
             
             # Add alert indicator to frame if assault detected
             if detection_status.get(feed_name, False):
@@ -458,7 +656,7 @@ def video_feed(feed_name):
         connection = get_connection()
         cursor = connection.cursor(dictionary=True)
         cursor.execute(
-            "SELECT feed_url FROM camera_feeds WHERE username = %s AND feed_name = %s",
+            "SELECT feed_url, emergency_contact FROM camera_feeds JOIN users ON camera_feeds.username = users.username WHERE camera_feeds.username = %s AND feed_name = %s",
             (session['username'], feed_name)
         )
         feed = cursor.fetchone()
@@ -469,7 +667,7 @@ def video_feed(feed_name):
             # Get feed URL from database and store in memory cache for the detection process
             camera_feeds[feed_name] = feed['feed_url']
             
-            return Response(generate_frames(feed_name),
+            return Response(generate_frames(feed_name,feed['emergency_contact']),
                           mimetype='multipart/x-mixed-replace; boundary=frame')
     except Exception as e:
         print(f"Error in video_feed: {str(e)}")
@@ -555,6 +753,50 @@ def change_password():
             error = f'Database error: {str(e)}'
     
     return render_template('change_password.html', error=error, success=success)
+
+# Configure Flask-Mail
+app.config['MAIL_SERVER'] = 'smtp.gmail.com'
+app.config['MAIL_PORT'] = 587
+app.config['MAIL_USE_TLS'] = True
+app.config['MAIL_USERNAME'] = os.environ.get('MAIL_USERNAME')
+app.config['MAIL_PASSWORD'] = os.environ.get('MAIL_PASSWORD') # Use app password for Gmail
+mail = Mail(app)
+
+@app.route('/contact', methods=['GET', 'POST'])
+def contact():
+    if request.method == 'POST':
+        name = request.form.get('name')
+        email = request.form.get('email')
+        subject = request.form.get('subject')
+        message = request.form.get('message')
+        
+        try:
+            msg = Message(
+                subject=f'Contact Form: {subject}',
+                sender=email,
+                recipients=['adityamanapure22@gmail.com'],
+                body=f'''
+From: {name} <{email}>
+
+{message}
+'''
+            )
+            mail.send(msg)
+            flash('Thank you for your message. We will get back to you soon!', 'success')
+        except Exception as e:
+            print(f"Error sending email: {e}")
+            flash('Sorry, there was an error sending your message. Please try again.', 'error')
+            
+        return redirect(url_for('contact'))
+        
+    return render_template('contact.html')
+
+@app.route('/privacy')
+def privacy():
+    return render_template('privacy_policy.html')
+@app.route('/terms')
+def terms():
+    return render_template('terms_of_service.html')
 
 if __name__ == '__main__':
     # Create templates directory if it doesn't exist
