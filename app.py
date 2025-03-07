@@ -18,22 +18,14 @@ app = Flask(__name__)
 app.secret_key = 'your_secret_key'  # Change this to a random string in production
 
 # MySQL Configuration
-try:
-    DB_CONFIG = {
+
+DB_CONFIG = {
     'host': os.environ.get('DB_HOST'),
     'user': os.environ.get('DB_USER'),
     'password': os.environ.get('DB_PASSWORD'),  # Change this to your MySQL password
     'database': os.environ.get('DB_NAME'),
     'port': os.environ.get('DB_PORT')
 }
-except Exception as e:
-    DB_CONFIG={
-        'host':'localhost',
-        'user':'root',
-        'password':'',
-        'database':'safe_women',
-        'port':3306
-    }
 
 def initialize_db():
     """Create database and tables if they don't exist"""
