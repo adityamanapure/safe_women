@@ -1,7 +1,8 @@
 from flask import Flask, render_template, request, redirect, url_for, session, Response, flash
-import cv2
+import sqlite3
 import os
 import torch
+import cv2
 from ultralytics import YOLO
 from functools import wraps
 import threading
@@ -11,124 +12,85 @@ import re
 import requests
 from flask_mail import Mail, Message
 import logging
-import psycopg2
-from psycopg2 import pool
+from os import environ
+import dotenv
 from urllib.parse import urlparse
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'your_secret_key')
 
-# PostgreSQL Configuration using URL
-DATABASE_URL = os.environ.get('DATABASE_URL', 'postgresql://postgres:password@localhost:5432/safe_women')
+# SQLite Configuration
+DATABASE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'safe_women.db')
 
-# Parse database URL
-url = urlparse(DATABASE_URL)
-DB_CONFIG = {
-    'host': url.hostname or 'localhost',
-    'user': url.username or 'postgres',
-    'password': url.password,
-    'database': url.path[1:] if url.path else 'safe_women',
-    'port': url.port or 5432
-}
+def get_db():
+    """Get database connection"""
+    db = sqlite3.connect(DATABASE_PATH)
+    db.row_factory = sqlite3.Row
+    return db
 
-def initialize_db():
-    """Create database and tables if they don't exist"""
+def init_db():
+    """Initialize database tables"""
     try:
-        # First connect to default database to create our database if it doesn't exist
-        conn = psycopg2.connect(
-            host=DB_CONFIG['host'],
-            user=DB_CONFIG['user'],
-            password=DB_CONFIG['password'],
-            database='postgres'
-        )
-        conn.autocommit = True
-        cur = conn.cursor()
-        
-        # Create database if it doesn't exist
-        cur.execute("SELECT 1 FROM pg_catalog.pg_database WHERE datname = %s", (DB_CONFIG['database'],))
-        exists = cur.fetchone()
-        if not exists:
-            cur.execute(f"CREATE DATABASE {DB_CONFIG['database']}")
-        
-        cur.close()
-        conn.close()
-        
-        # Connect to our database and create tables
-        connection = get_connection()
-        cursor = connection.cursor()
-        
+        db = get_db()
+        cursor = db.cursor()
+
         # Create users table
         cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
-            username VARCHAR(50) PRIMARY KEY,
-            password VARCHAR(256) NOT NULL,
-            role VARCHAR(10) NOT NULL,
-            emergency_contact VARCHAR(20),
-            emergency_contact_verified BOOLEAN DEFAULT FALSE,
+            username TEXT PRIMARY KEY,
+            password TEXT NOT NULL,
+            role TEXT NOT NULL,
+            emergency_contact TEXT,
+            emergency_contact_verified INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         ''')
-        
+
         # Create camera_feeds table
         cursor.execute('''
         CREATE TABLE IF NOT EXISTS camera_feeds (
-            id SERIAL PRIMARY KEY,
-            username VARCHAR(50) REFERENCES users(username) ON DELETE CASCADE,
-            feed_name VARCHAR(100) NOT NULL,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL,
+            feed_name TEXT NOT NULL,
             feed_url TEXT NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (username) REFERENCES users(username) ON DELETE CASCADE,
             UNIQUE(username, feed_name)
         )
         ''')
-        
+
         # Check if admin user exists
         cursor.execute("SELECT COUNT(*) FROM users WHERE username = 'admin'")
         admin_count = cursor.fetchone()[0]
-        
+
         # Create admin user if it doesn't exist
         if admin_count == 0:
             admin_password = hashlib.sha256('password'.encode()).hexdigest()
             cursor.execute(
-                "INSERT INTO users (username, password, role) VALUES (%s, %s, %s)",
+                "INSERT INTO users (username, password, role) VALUES (?, ?, ?)",
                 ('admin', admin_password, 'admin')
             )
             print("✅ Default admin user created")
-        
-        connection.commit()
-        cursor.close()
-        connection.close()
+
+        db.commit()
         print("✅ Database initialized successfully")
     except Exception as e:
         print(f"❌ Error initializing database: {e}")
         raise
+    finally:
+        db.close()
 
-# Create PostgreSQL connection pool
-try:
-    connection_pool = pool.SimpleConnectionPool(
-        minconn=1,
-        maxconn=10,
-        host=DB_CONFIG['host'],
-        user=DB_CONFIG['user'],
-        password=DB_CONFIG['password'],
-        database=DB_CONFIG['database'],
-        port=DB_CONFIG['port']
-    )
-    print("✅ PostgreSQL connection pool created successfully")
-    initialize_db()
-except Exception as e:
-    print(f"❌ Error creating PostgreSQL connection pool: {e}")
-    connection_pool = None
+# Initialize database
+init_db()
 
+# Update all database operations to use SQLite
 def get_connection():
-    """Get a connection from the pool"""
-    if connection_pool:
-        return connection_pool.getconn()
-    raise Exception("Database connection pool not available")
+    """Get database connection (compatibility function)"""
+    return get_db()
 
 def return_connection(conn):
-    """Return a connection to the pool"""
-    if connection_pool:
-        connection_pool.putconn(conn)
+    """Close database connection (compatibility function)"""
+    conn.close()
 
 # Dictionary to store the camera feeds and their detection status
 camera_feeds = {}
@@ -161,12 +123,12 @@ def admin_required(f):
         try:
             connection = get_connection()
             cursor = connection.cursor()
-            cursor.execute("SELECT role FROM users WHERE username = %s", (session['username'],))
+            cursor.execute("SELECT role FROM users WHERE username = ?", (session['username'],))
             user = cursor.fetchone()
             cursor.close()
             return_connection(connection)
             
-            if not user or user[0] != 'admin':
+            if not user or user['role'] != 'admin':
                 flash('Admin access required for this page', 'error')
                 return redirect(url_for('home'))
                 
@@ -189,21 +151,21 @@ def login():
         password = request.form['password']
         
         try:
-            connection = get_connection()
-            cursor = connection.cursor()
-            cursor.execute("SELECT * FROM users WHERE username = %s", (username,))
+            db = get_db()
+            cursor = db.cursor()
+            cursor.execute("SELECT * FROM users WHERE username = ?", (username,))
             user = cursor.fetchone()
-            cursor.close()
-            return_connection(connection)
             
-            if user and user[1] == hashlib.sha256(password.encode()).hexdigest():
+            if user and user['password'] == hashlib.sha256(password.encode()).hexdigest():
                 session['username'] = username
-                session['role'] = user[2]
+                session['role'] = user['role']
                 return redirect(url_for('home'))
             else:
                 error = 'Invalid credentials. Please try again.'
         except Exception as e:
             error = f'Database error: {str(e)}'
+        finally:
+            db.close()
     
     return render_template('login.html', error=error)
 
@@ -230,7 +192,7 @@ def signup():
                 cursor = connection.cursor()
                 
                 # Check if username exists
-                cursor.execute("SELECT username FROM users WHERE username = %s", (username,))
+                cursor.execute("SELECT username FROM users WHERE username = ?", (username,))
                 user_exists = cursor.fetchone()
                 
                 if user_exists:
@@ -239,7 +201,7 @@ def signup():
                     # Add new user
                     hashed_password = hashlib.sha256(password.encode()).hexdigest()
                     cursor.execute(
-                        "INSERT INTO users (username, password, role) VALUES (%s, %s, %s)",
+                        "INSERT INTO users (username, password, role) VALUES (?, ?, ?)",
                         (username, hashed_password, 'user')
                     )
                     connection.commit()
@@ -277,7 +239,7 @@ def home():
             
             # Store the camera feed in the database
             cursor.execute(
-                "INSERT INTO camera_feeds (username, feed_name, feed_url) VALUES (%s, %s, %s)",
+                "INSERT INTO camera_feeds (username, feed_name, feed_url) VALUES (?, ?, ?)",
                 (session['username'], feed_name, feed_url)
             )
             connection.commit()
@@ -285,11 +247,10 @@ def home():
             return_connection(connection)
             
             flash(f'Camera feed "{feed_name}" added successfully', 'success')
-        except psycopg2.Error as err:
-            if err.pgcode == '23505':  # Duplicate entry error
-                flash(f'A camera with name "{feed_name}" already exists', 'error')
-            else:
-                flash(f'Database error: {str(err)}', 'error')
+        except sqlite3.IntegrityError as err:
+            flash(f'A camera with name "{feed_name}" already exists', 'error')
+        except Exception as e:
+            flash(f'Database error: {str(e)}', 'error')
         
         return redirect(url_for('home'))
     
@@ -299,7 +260,7 @@ def home():
         connection = get_connection()
         cursor = connection.cursor()
         cursor.execute(
-            "SELECT feed_name, feed_url FROM camera_feeds WHERE username = %s",
+            "SELECT feed_name, feed_url FROM camera_feeds WHERE username = ?",
             (session['username'],)
         )
         results = cursor.fetchall()
@@ -307,7 +268,7 @@ def home():
         return_connection(connection)
         
         for row in results:
-            camera_feeds_for_user[row[0]] = row[1]
+            camera_feeds_for_user[row['feed_name']] = row['feed_url']
     except Exception as e:
         flash(f'Error loading camera feeds: {str(e)}', 'error')
     
@@ -342,7 +303,7 @@ def delete_user(username):
     try:
         connection = get_connection()
         cursor = connection.cursor()
-        cursor.execute("DELETE FROM users WHERE username = %s", (username,))
+        cursor.execute("DELETE FROM users WHERE username = ?", (username,))
         connection.commit()
         cursor.close()
         return_connection(connection)
@@ -368,7 +329,7 @@ def change_role(username):
     try:
         connection = get_connection()
         cursor = connection.cursor()
-        cursor.execute("UPDATE users SET role = %s WHERE username = %s", (role, username))
+        cursor.execute("UPDATE users SET role = ? WHERE username = ?", (role, username))
         connection.commit()
         cursor.close()
         return_connection(connection)
@@ -388,7 +349,7 @@ def delete_camera(feed_name):
         
         # Delete the camera feed from the database
         cursor.execute(
-            "DELETE FROM camera_feeds WHERE username = %s AND feed_name = %s",
+            "DELETE FROM camera_feeds WHERE username = ? AND feed_name = ?",
             (session['username'], feed_name)
         )
         connection.commit()
@@ -428,9 +389,9 @@ def manage_emergency_contact():
                 # Update emergency contact in database
                 cursor.execute(
                     """UPDATE users 
-                    SET emergency_contact = %s, 
-                        emergency_contact_verified = FALSE 
-                    WHERE username = %s""", 
+                    SET emergency_contact = ?, 
+                        emergency_contact_verified = 0 
+                    WHERE username = ?""", 
                     (phone_number, session['username'])
                 )
                 connection.commit()
@@ -444,14 +405,14 @@ def manage_emergency_contact():
         # Retrieve current emergency contact
         cursor.execute(
             """SELECT emergency_contact, emergency_contact_verified 
-            FROM users WHERE username = %s""", 
+            FROM users WHERE username = ?""", 
             (session['username'],)
         )
         user_info = cursor.fetchone()
         
         current_contact = {
-            'number': user_info[0] if user_info else None,
-            'verified': user_info[1] if user_info else False
+            'number': user_info['emergency_contact'] if user_info else None,
+            'verified': user_info['emergency_contact_verified'] if user_info else False
         }
         
         cursor.close()
@@ -478,7 +439,7 @@ def verify_emergency_contact():
         # Retrieve current user's emergency contact
         cursor.execute(
             """SELECT emergency_contact 
-            FROM users WHERE username = %s""", 
+            FROM users WHERE username = ?""", 
             (session['username'],)
         )
         user_info = cursor.fetchone()
@@ -491,8 +452,8 @@ def verify_emergency_contact():
                 # Mark contact as verified
                 cursor.execute(
                     """UPDATE users 
-                    SET emergency_contact_verified = TRUE 
-                    WHERE username = %s""", 
+                    SET emergency_contact_verified = 1 
+                    WHERE username = ?""", 
                     (session['username'],)
                 )
                 connection.commit()
@@ -510,7 +471,7 @@ def verify_emergency_contact():
     return render_template('verify_emergency_contact.html', 
                            error=error, 
                            success=success, 
-                           contact_number=user_info[0] if user_info else None)
+                           contact_number=user_info['emergency_contact'] if user_info else None)
 
 def generate_verification_code():
     """Generate a 6-digit verification code"""
@@ -529,8 +490,6 @@ def verify_sms_code(code):
     """
     # Simulated verification - replace with actual verification logic
     return len(code) == 6 and code.isdigit()
-
-
 
 # Modify send_sms_alert function to handle verification
 def send_sms_alert(phone_number, message, server_url="https://textbelt.com/text"):
@@ -575,7 +534,6 @@ def send_sms_alert(phone_number, message, server_url="https://textbelt.com/text"
         # Log any errors
         logging.error(f"Error sending SMS: {e}")
         return False
-
 
 def get_location():
     try:
@@ -675,7 +633,7 @@ def video_feed(feed_name):
         connection = get_connection()
         cursor = connection.cursor()
         cursor.execute(
-            "SELECT feed_url, emergency_contact FROM camera_feeds JOIN users ON camera_feeds.username = users.username WHERE camera_feeds.username = %s AND feed_name = %s",
+            "SELECT feed_url, emergency_contact FROM camera_feeds JOIN users ON camera_feeds.username = users.username WHERE camera_feeds.username = ? AND feed_name = ?",
             (session['username'], feed_name)
         )
         feed = cursor.fetchone()
@@ -684,9 +642,9 @@ def video_feed(feed_name):
         
         if feed:
             # Get feed URL from database and store in memory cache for the detection process
-            camera_feeds[feed_name] = feed[0]
+            camera_feeds[feed_name] = feed['feed_url']
             
-            return Response(generate_frames(feed_name,feed[1]),
+            return Response(generate_frames(feed_name,feed['emergency_contact']),
                           mimetype='multipart/x-mixed-replace; boundary=frame')
     except Exception as e:
         print(f"Error in video_feed: {str(e)}")
@@ -707,7 +665,7 @@ def live_feed():
         connection = get_connection()
         cursor = connection.cursor()
         cursor.execute(
-            "SELECT feed_name, feed_url FROM camera_feeds WHERE username = %s",
+            "SELECT feed_name, feed_url FROM camera_feeds WHERE username = ?",
             (session['username'],)
         )
         results = cursor.fetchall()
@@ -715,9 +673,9 @@ def live_feed():
         return_connection(connection)
         
         for row in results:
-            camera_feeds_for_user[row[0]] = row[1]
+            camera_feeds_for_user[row['feed_name']] = row['feed_url']
             # Also cache in memory for the detection process
-            camera_feeds[row[0]] = row[1]
+            camera_feeds[row['feed_name']] = row['feed_url']
     except Exception as e:
         flash(f'Error loading camera feeds: {str(e)}', 'error')
     
@@ -746,11 +704,11 @@ def change_password():
             cursor = connection.cursor()
             
             # Get current user
-            cursor.execute("SELECT password FROM users WHERE username = %s", (session['username'],))
+            cursor.execute("SELECT password FROM users WHERE username = ?", (session['username'],))
             user = cursor.fetchone()
             
             # Check if current password is correct
-            if not user or user[0] != hashlib.sha256(current_password.encode()).hexdigest():
+            if not user or user['password'] != hashlib.sha256(current_password.encode()).hexdigest():
                 error = 'Current password is incorrect.'
             elif len(new_password) < 6:
                 error = 'New password must be at least 6 characters long.'
@@ -760,7 +718,7 @@ def change_password():
                 # Update password
                 hashed_password = hashlib.sha256(new_password.encode()).hexdigest()
                 cursor.execute(
-                    "UPDATE users SET password = %s WHERE username = %s", 
+                    "UPDATE users SET password = ? WHERE username = ?", 
                     (hashed_password, session['username'])
                 )
                 connection.commit()
@@ -773,12 +731,13 @@ def change_password():
     
     return render_template('change_password.html', error=error, success=success)
 
+dotenv.load_dotenv()
 # Configure Flask-Mail
 app.config['MAIL_SERVER'] = 'smtp.gmail.com'
 app.config['MAIL_PORT'] = 587
 app.config['MAIL_USE_TLS'] = True
-app.config['MAIL_USERNAME'] = os.environ.get('MAIL_USERNAME')
-app.config['MAIL_PASSWORD'] = os.environ.get('MAIL_PASSWORD') # Use app password for Gmail
+app.config['MAIL_USERNAME'] =  os.environ.get('MAIL_USERNAME')
+app.config['MAIL_PASSWORD'] =  os.environ.get('MAIL_PASSWORD') # Use app password for Gmail
 mail = Mail(app)
 
 @app.route('/contact', methods=['GET', 'POST'])
